@@ -1,0 +1,60 @@
+# WP Media Cleaner
+
+A WordPress admin plugin that scans the media library for unused attachments and permanently deletes them - files, all WordPress-generated sizes, and database records in one pass.
+
+## Features
+
+- Batched scan with live progress bar - handles large libraries without timeouts
+- Seven-point usage check: post parent, featured image, post content URLs, WooCommerce product gallery, ACF image/file fields, site icon/custom logo, and options table
+- Card grid UI with thumbnail previews and file type badges
+- Multi-select with floating action bar
+- Confirmation modal listing files before deletion
+- Live stats: total scanned, unused count, estimated disk savings
+
+## How it works
+
+**Scan** - Fetches attachments in batches of 100 via AJAX. For each batch, a single call to `tymc_filter_unused()` runs ~6–8 DB queries to classify the entire batch, rather than per-attachment queries. Attachments that pass all seven checks are returned as unused and rendered as cards.
+
+**Delete** - Selected IDs are sent to `wp_delete_attachment( $id, true )`, which permanently removes the post row, all postmeta, the original file, and every resized variant WordPress has generated.
+
+## Usage checks
+
+An attachment is considered **in use** if any of the following are true:
+
+| # | Check | Method |
+|---|---|---|
+| 1 | Has a `post_parent` (attached via editor uploader) | Batch DB query |
+| 2 | Used as a featured image (`_thumbnail_id`) | Batch IN() query |
+| 3 | URL appears in any published post content | Per-item LIKE query |
+| 4 | Included in a WooCommerce product gallery | Single query, resolved in PHP |
+| 5 | Stored in any postmeta value (ACF image/file fields) | Batch IN() query |
+| 6 | Set as site icon or custom logo | `get_option` / `get_theme_mod` |
+| 7 | URL or quoted ID appears in the options table | Per-item LIKE query |
+
+## Requirements
+
+- WordPress 6.0+
+- PHP 8.1+
+- `delete_posts` capability to access the page
+
+## Installation
+
+Drop the `throwyo-media-cleaner/` folder into `wp-content/plugins/` and activate via **Plugins → Installed Plugins**. The tool appears under **Media → Media Cleaner**.
+
+## Changelog
+
+### 1.2.0
+- Replaced per-attachment `tymc_is_unused()` with `tymc_filter_unused()` - batch DB queries reduce scan query count from ~6N to ~6–8 per 100-item batch
+- Fixed multi-file delete: `URLSearchParams` array serialization bug meant only the first selected ID was deleted
+- URL computed during content check is cached and reused for the options check
+- JS: added `itemById` Map for O(1) modal lookups; cached scan button SVG reference; post-delete filtering uses a Set
+
+### 1.1.0
+- Added WooCommerce product gallery check
+- Added options table check for ACF options fields
+- Added site icon and custom logo exclusions
+- Progress bar with shimmer animation
+
+### 1.0.0
+- Initial release
+# wp-media-cleaner
