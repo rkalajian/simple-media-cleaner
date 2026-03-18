@@ -39,12 +39,17 @@ An attachment is considered **in use** if any of the following are true:
 
 ## Installation
 
-Drop the `throwyo-media-cleaner/` folder into `wp-content/plugins/` and activate via **Plugins → Installed Plugins**. The tool appears under **Media → Media Cleaner**.
+Drop the `wp-media-cleaner/` folder into `wp-content/plugins/` and activate via **Plugins → Installed Plugins**. The tool appears under **Media → Media Cleaner**.
 
 ## Changelog
 
+### 1.3.0
+- Fixed delete doing nothing for large selections: IDs are now sent in chunks of 50, staying well under PHP's `max_input_vars` limit (default 1000)
+- Deletion progress is now shown in the floating action bar (fixed at the bottom of the viewport) so it remains visible regardless of scroll position
+- Progress bar fills per-chunk with a file count and percentage; holds at 100% briefly before restoring the selection UI
+
 ### 1.2.0
-- Replaced per-attachment `tymc_is_unused()` with `tymc_filter_unused()` - batch DB queries reduce scan query count from ~6N to ~6–8 per 100-item batch
+- Replaced per-attachment `tymc_is_unused()` with `tymc_filter_unused()` - batch DB queries reduce scan query count from ~6N to ~6-8 per 100-item batch
 - Fixed multi-file delete: `URLSearchParams` array serialization bug meant only the first selected ID was deleted
 - URL computed during content check is cached and reused for the options check
 - JS: added `itemById` Map for O(1) modal lookups; cached scan button SVG reference; post-delete filtering uses a Set
