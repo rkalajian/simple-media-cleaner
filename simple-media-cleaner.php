@@ -168,14 +168,15 @@ function tymc_filter_unused( array $ids ): array {
 
 	// ── 2. Used as a featured image ───────────────────────────────────────
 	$placeholders = implode( ',', array_fill( 0, count( $remaining ), '%s' ) );
-	$rows = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+	$rows = $wpdb->get_col(
 		$wpdb->prepare(
 			"SELECT DISTINCT meta_value FROM {$wpdb->postmeta}
 			 WHERE meta_key = '_thumbnail_id' AND meta_value IN ($placeholders)",
 			...$remaining
 		)
 	);
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 	foreach ( $rows as $id ) {
 		$in_use[ (int) $id ] = true;
 	}
@@ -190,8 +191,8 @@ function tymc_filter_unused( array $ids ): array {
 		$url               = wp_get_attachment_url( $id );
 		$url_cache[ $id ]  = $url;
 		$url_no_scheme     = preg_replace( '#^https?://#', '//', $url );
-		if ( $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->prepare(
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		if ( $wpdb->get_var( $wpdb->prepare(
 			"SELECT 1 FROM {$wpdb->posts}
 			 WHERE post_status NOT IN ('trash','auto-draft')
 			 AND (post_content LIKE %s OR post_content LIKE %s)
@@ -201,6 +202,7 @@ function tymc_filter_unused( array $ids ): array {
 		) ) ) {
 			$in_use[ $id ] = true;
 		}
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 	}
 
 	$remaining = array_values( array_diff( $ids, array_keys( $in_use ) ) );
@@ -230,8 +232,8 @@ function tymc_filter_unused( array $ids ): array {
 
 	// ── 5. Any postmeta value equal to this ID (ACF image/file fields) ────
 	$placeholders = implode( ',', array_fill( 0, count( $remaining ), '%s' ) );
-	$rows = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.LikeWildcardsInQuery
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.LikeWildcardsInQuery
+	$rows = $wpdb->get_col(
 		$wpdb->prepare(
 			"SELECT DISTINCT meta_value FROM {$wpdb->postmeta}
 			 WHERE meta_value IN ($placeholders)
@@ -240,6 +242,7 @@ function tymc_filter_unused( array $ids ): array {
 			...$remaining
 		)
 	);
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.LikeWildcardsInQuery
 	foreach ( $rows as $id ) {
 		if ( in_array( (int) $id, $remaining, true ) ) {
 			$in_use[ (int) $id ] = true;
