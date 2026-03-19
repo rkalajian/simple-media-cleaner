@@ -308,6 +308,20 @@ function tymc_render_page(): void {
 					</div>
 				</div>
 				<div class="tymc-app-header-actions">
+					<a
+						href="https://ko-fi.com/rkalajian"
+						target="_blank"
+						rel="noopener noreferrer"
+						class="tymc-btn tymc-btn--ghost"
+						aria-label="Support me on Ko-Fi (opens in a new tab)"
+					>
+						<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+							<path d="M4 9.5A2.5 2.5 0 0 1 6.5 7h8A2.5 2.5 0 0 1 17 9.5v5A4.5 4.5 0 0 1 12.5 19h-4A4.5 4.5 0 0 1 4 14.5v-5Z" stroke="currentColor" stroke-width="1.8"/>
+							<path d="M17 10h1.5A2.5 2.5 0 0 1 21 12.5v.5a2.5 2.5 0 0 1-2.5 2.5H17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+							<path d="M10.95 11.2c-.44-.76-1.45-.9-2.02-.3-.58.6-.52 1.67.16 2.2l2.4 1.9 2.4-1.9c.68-.53.74-1.6.16-2.2-.57-.6-1.58-.46-2.02.3l-.54.91-.54-.91Z" fill="currentColor"/>
+						</svg>
+						Support me on Ko-Fi
+					</a>
 					<button id="tymc-scan-btn" class="tymc-btn tymc-btn--primary">
 						<?php echo tymc_svg( 'search', 15 ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>
 						Scan Library
