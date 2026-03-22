@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Simple Media Cleaner
- * Description: Find and delete unused media library files.
- * Version: 1.4.0
+ * Description: Find and delete unused, unattached, and broken media library files.
+ * Version: 1.5.0
  * Author: Rob Kalajian (https://robkalajian.me)
  * License: GPL-2.0+
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -10,7 +10,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'TYMC_VERSION', '1.4.0' );
+define( 'TYMC_VERSION', '1.5.0' );
 define( 'TYMC_FILE', __FILE__ );
 
 // ---------------------------------------------------------------------------
@@ -378,13 +378,20 @@ function tymc_filter_unused( array $ids ): array {
 	$remaining = array_values( array_diff( $ids, array_keys( $in_use ) ) );
 	if ( empty( $remaining ) ) return [];
 
-	// ── 2. Used as a featured image ───────────────────────────────────────
+	// ── 2. Used as a featured image on a post that still exists ──────────
+	// Must JOIN against wp_posts to skip stale _thumbnail_id rows left behind
+	// when a post is permanently deleted without cleaning up its postmeta.
 	$placeholders = implode( ',', array_fill( 0, count( $remaining ), '%s' ) );
 	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
 	$rows = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT DISTINCT meta_value FROM {$wpdb->postmeta}
-			 WHERE meta_key = '_thumbnail_id' AND meta_value IN ($placeholders)",
+			"SELECT DISTINCT pm.meta_value
+			 FROM {$wpdb->postmeta} AS pm
+			 INNER JOIN {$wpdb->posts} AS p ON p.ID = pm.post_id
+			 WHERE pm.meta_key = '_thumbnail_id'
+			   AND pm.meta_value IN ($placeholders)
+			   AND p.post_status NOT IN ('trash','auto-draft')
+			   AND p.post_type != 'revision'",
 			...$remaining
 		)
 	);
@@ -421,10 +428,14 @@ function tymc_filter_unused( array $ids ): array {
 	if ( empty( $remaining ) ) return [];
 
 	// ── 4. WooCommerce product gallery ────────────────────────────────────
-	// Fetch all gallery strings once; resolve in PHP.
+	// Only count galleries belonging to products that still exist.
 	$galleries = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		"SELECT meta_value FROM {$wpdb->postmeta}
-		 WHERE meta_key = '_product_image_gallery' AND meta_value != ''"
+		"SELECT pm.meta_value
+		 FROM {$wpdb->postmeta} AS pm
+		 INNER JOIN {$wpdb->posts} AS p ON p.ID = pm.post_id
+		 WHERE pm.meta_key = '_product_image_gallery'
+		   AND pm.meta_value != ''
+		   AND p.post_status NOT IN ('trash','auto-draft')" // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 	);
 	if ( $galleries ) {
 		$remaining_flip = array_flip( $remaining );
@@ -443,14 +454,19 @@ function tymc_filter_unused( array $ids ): array {
 	if ( empty( $remaining ) ) return [];
 
 	// ── 5. Any postmeta value equal to this ID (ACF image/file fields) ────
+	// JOIN against wp_posts so stale meta rows from deleted posts are ignored.
 	$placeholders = implode( ',', array_fill( 0, count( $remaining ), '%s' ) );
 	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.LikeWildcardsInQuery
 	$rows = $wpdb->get_col(
 		$wpdb->prepare(
-			"SELECT DISTINCT meta_value FROM {$wpdb->postmeta}
-			 WHERE meta_value IN ($placeholders)
-			 AND meta_key NOT IN ('_thumbnail_id','_product_image_gallery')
-			 AND meta_key NOT LIKE '\_%wc%'",
+			"SELECT DISTINCT pm.meta_value
+			 FROM {$wpdb->postmeta} AS pm
+			 INNER JOIN {$wpdb->posts} AS p ON p.ID = pm.post_id
+			 WHERE pm.meta_value IN ($placeholders)
+			   AND pm.meta_key NOT IN ('_thumbnail_id','_product_image_gallery')
+			   AND pm.meta_key NOT LIKE '\_%wc%'
+			   AND p.post_status NOT IN ('trash','auto-draft')
+			   AND p.post_type != 'revision'",
 			...$remaining
 		)
 	);
@@ -516,7 +532,7 @@ function tymc_render_page(): void {
 					</div>
 					<div class="tymc-app-header-text">
 						<h1>Media Cleaner</h1>
-						<p>Find and permanently remove unused files from your media library.</p>
+						<p>Find and remove unused files, DB records with missing files, and on-disk files with no library entry.</p>
 					</div>
 				</div>
 				<div class="tymc-app-header-actions">
@@ -569,8 +585,15 @@ function tymc_render_page(): void {
 			<div class="tymc-stat-cell">
 				<div class="tymc-stat-icon tymc-stat-icon--red"><?php echo tymc_svg( 'alert', 18 ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?></div>
 				<div class="tymc-stat-body">
-					<div class="tymc-stat-label">Unused Files</div>
+					<div class="tymc-stat-label">Removable Files</div>
 					<div class="tymc-stat-value" id="stat-unused">—</div>
+				</div>
+			</div>
+			<div class="tymc-stat-cell">
+				<div class="tymc-stat-icon tymc-stat-icon--red"><?php echo tymc_svg( 'alert', 18 ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?></div>
+				<div class="tymc-stat-body">
+					<div class="tymc-stat-label">Missing Files</div>
+					<div class="tymc-stat-value" id="stat-broken">—</div>
 				</div>
 			</div>
 			<div class="tymc-stat-cell">
@@ -589,7 +612,7 @@ function tymc_render_page(): void {
 		<div id="tymc-results" hidden>
 			<div class="tymc-grid-header">
 				<div class="tymc-grid-header-title">
-					Unused files <span id="tymc-grid-count"></span>
+					Removable files <span id="tymc-grid-count"></span>
 				</div>
 				<div class="tymc-grid-controls">
 					<button id="tymc-select-all-btn" class="tymc-btn tymc-btn--ghost">Select all</button>
@@ -693,6 +716,7 @@ function tymc_render_page(): void {
 		const floatProgressPct    = $('tymc-float-progress-pct');
 		const statScanned  = $('stat-scanned');
 		const statUnused   = $('stat-unused');
+		const statBroken   = $('stat-broken');
 		const statSize     = $('stat-size');
 		const modal        = $('tymc-modal');
 		const modalCount   = $('tymc-modal-count');
@@ -701,9 +725,10 @@ function tymc_render_page(): void {
 		const modalConfirm        = $('tymc-modal-confirm');
 		const unattachedOnlyChk   = $('tymc-unattached-only');
 
-		let allItems  = [];
-		let itemByKey = new Map(); // key → item — O(1) lookups
-		let totalSize = 0;
+		let allItems    = [];
+		let itemByKey   = new Map(); // key → item — O(1) lookups
+		let totalSize   = 0;
+		let brokenCount = 0;
 
 		// Generate a stable key for an item: real ID for DB items, path for orphans.
 		function itemKey(item) {
@@ -816,18 +841,22 @@ function tymc_render_page(): void {
 				allItems.push(item);
 				itemByKey.set(key, item);
 				totalSize += item.size_raw || 0;
+				if (item.reason === 'broken') brokenCount++;
 				gridEl.appendChild(buildCard(item));
 			});
 			statsEl.hidden = false;
 			statUnused.textContent = allItems.length.toLocaleString();
 			statUnused.className   = 'tymc-stat-value' + (allItems.length > 0 ? ' is-warn' : ' is-ok');
+			statBroken.textContent = brokenCount > 0 ? brokenCount.toLocaleString() : '—';
+			statBroken.className   = 'tymc-stat-value' + (brokenCount > 0 ? ' is-warn' : ' is-ok');
 			statSize.textContent   = totalSize > 0 ? fmtBytes(totalSize) : '—';
 		}
 
 		async function runScan() {
-			allItems  = [];
-			itemByKey = new Map();
-			totalSize = 0;
+			allItems    = [];
+			itemByKey   = new Map();
+			totalSize   = 0;
+			brokenCount = 0;
 			gridEl.innerHTML = '';
 			resultsEl.hidden  = true;
 			emptyEl.hidden    = true;
