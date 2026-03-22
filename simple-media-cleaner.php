@@ -48,20 +48,34 @@ add_action( 'wp_ajax_tymc_scan', function () {
 		wp_send_json_error( 'Permission denied.' );
 	}
 
-	$offset = max( 0, intval( $_POST['offset'] ?? 0 ) );
-	$batch  = 100;
+	$offset          = max( 0, intval( $_POST['offset'] ?? 0 ) );
+	$unattached_only = ! empty( $_POST['unattached_only'] );
+	$batch           = 100;
 
-	$attachment_ids = get_posts( [
+	$query_args = [
 		'post_type'      => 'attachment',
 		'post_status'    => 'any',
 		'posts_per_page' => $batch,
 		'offset'         => $offset,
 		'fields'         => 'ids',
-	] );
+	];
+	if ( $unattached_only ) {
+		$query_args['post_parent'] = 0;
+	}
 
+	$attachment_ids = get_posts( $query_args );
+
+	// Count total for progress bar — sum all statuses to avoid missing edge cases.
 	$counts = wp_count_posts( 'attachment' );
-	$total  = (int) ( $counts->inherit ?? 0 )
-			+ (int) ( $counts->{'0'} ?? 0 );
+	if ( $unattached_only ) {
+		// For unattached-only mode, count only attachments with no parent.
+		global $wpdb;
+		$total = (int) $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_parent = 0"
+		);
+	} else {
+		$total = array_sum( array_map( 'intval', (array) $counts ) );
+	}
 
 	// Batch-detect unused IDs — O(~6) queries for the whole batch.
 	$unused_ids = tymc_filter_unused( $attachment_ids );
