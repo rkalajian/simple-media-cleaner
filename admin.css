@@ -499,6 +499,61 @@
 	line-height: 1;
 }
 
+/* Card reason badges */
+.tymc-card-badge {
+	display: inline-flex;
+	align-items: center;
+	font-size: 9.5px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	padding: 2px 5px;
+	border-radius: 3px;
+	line-height: 1.4;
+	margin-bottom: 3px;
+}
+
+.tymc-card-badge--broken {
+	background: #fceaea;
+	color: #b32d2e;
+}
+
+.tymc-card-badge--orphan {
+	background: #fef5e4;
+	color: #92670a;
+}
+
+.tymc-modal-badge {
+	display: inline-flex;
+	align-items: center;
+	font-size: 9px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	padding: 1px 4px;
+	border-radius: 3px;
+	line-height: 1.4;
+	margin-right: 5px;
+	vertical-align: middle;
+}
+
+/* Filter toggle in header */
+.tymc-filter-toggle {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	font-size: 12.5px;
+	color: var(--tymc-ink-3);
+	cursor: pointer;
+	user-select: none;
+	white-space: nowrap;
+}
+
+.tymc-filter-toggle input[type="checkbox"] {
+	margin: 0;
+	cursor: pointer;
+}
+
 /* ── Floating selection bar ────────────────────────────────────────────────── */
 
 .tymc-float-bar {

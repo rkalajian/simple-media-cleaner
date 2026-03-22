@@ -77,14 +77,30 @@ add_action( 'wp_ajax_tymc_scan', function () {
 		$total = array_sum( array_map( 'intval', (array) $counts ) );
 	}
 
-	// Batch-detect unused IDs — O(~6) queries for the whole batch.
-	$unused_ids = tymc_filter_unused( $attachment_ids );
+	// Separate broken references (DB entry but file missing on disk) from healthy.
+	$broken_ids  = [];
+	$healthy_ids = [];
+	foreach ( $attachment_ids as $id ) {
+		$file = get_attached_file( $id );
+		if ( ! $file || ! file_exists( $file ) ) {
+			$broken_ids[] = $id;
+		} else {
+			$healthy_ids[] = $id;
+		}
+	}
+
+	// Batch-detect unused IDs from healthy attachments only.
+	$unused_ids = tymc_filter_unused( $healthy_ids );
+
+	// Combine: broken references + truly unused (both are safe to remove).
+	$all_removable = array_merge( $broken_ids, $unused_ids );
 
 	$unused = [];
-	foreach ( $unused_ids as $id ) {
+	foreach ( $all_removable as $id ) {
+		$is_broken = in_array( $id, $broken_ids, true );
 		$file      = get_attached_file( $id );
-		$meta      = wp_get_attachment_metadata( $id );
-		$size_raw  = $meta['filesize'] ?? ( $file ? @filesize( $file ) : 0 );
+		$meta      = $is_broken ? [] : ( wp_get_attachment_metadata( $id ) ?: [] );
+		$size_raw  = $is_broken ? 0 : ( $meta['filesize'] ?? ( $file ? @filesize( $file ) : 0 ) );
 		$mime      = get_post_mime_type( $id );
 		$ext       = $file ? strtolower( pathinfo( $file, PATHINFO_EXTENSION ) ) : '';
 
@@ -92,7 +108,7 @@ add_action( 'wp_ajax_tymc_scan', function () {
 			'id'       => $id,
 			'filename' => basename( $file ?? '' ) ?: "(attachment {$id})",
 			'url'      => wp_get_attachment_url( $id ),
-			'thumb'    => str_starts_with( $mime, 'image/' )
+			'thumb'    => ( ! $is_broken && str_starts_with( $mime ?: '', 'image/' ) )
 					? ( wp_get_attachment_image_url( $id, 'thumbnail' )
 					  ?: wp_get_attachment_image_url( $id, 'medium' )
 					  ?: wp_get_attachment_url( $id ) )
@@ -101,6 +117,7 @@ add_action( 'wp_ajax_tymc_scan', function () {
 			'ext'      => $ext,
 			'size'     => $size_raw ? size_format( $size_raw ) : '—',
 			'size_raw' => (int) $size_raw,
+			'reason'   => $is_broken ? 'broken' : 'unused',
 		];
 	}
 
@@ -149,6 +166,181 @@ add_action( 'wp_ajax_tymc_delete', function () {
 } );
 
 // ---------------------------------------------------------------------------
+// AJAX: scan orphaned files (on disk but no DB attachment record)
+// ---------------------------------------------------------------------------
+
+add_action( 'wp_ajax_tymc_scan_orphans', function () {
+	check_ajax_referer( 'tymc_nonce', 'nonce' );
+	if ( ! current_user_can( 'delete_posts' ) ) {
+		wp_send_json_error( 'Permission denied.' );
+	}
+
+	global $wpdb;
+	$upload_dir = wp_upload_dir();
+	$base_path  = realpath( $upload_dir['basedir'] );
+	$base_url   = trailingslashit( $upload_dir['baseurl'] );
+
+	if ( ! $base_path || ! is_dir( $base_path ) ) {
+		wp_send_json_error( 'Uploads directory not found.' );
+	}
+
+	// Build a set of all known paths: original files + all generated sizes.
+	$known_paths = [];
+
+	$orig_files = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		"SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file'"
+	);
+	foreach ( $orig_files as $rel ) {
+		$abs = realpath( $base_path . DIRECTORY_SEPARATOR . ltrim( $rel, '/\\' ) );
+		if ( $abs ) {
+			$known_paths[ $abs ] = true;
+		}
+		// Also track the unresolved path for files that don't exist yet on disk.
+		$known_paths[ $base_path . DIRECTORY_SEPARATOR . ltrim( str_replace( '/', DIRECTORY_SEPARATOR, $rel ), DIRECTORY_SEPARATOR ) ] = true;
+	}
+
+	$meta_rows = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		"SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attachment_metadata'"
+	);
+	foreach ( $meta_rows as $serialized ) {
+		$meta = @unserialize( $serialized ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+		if ( ! is_array( $meta ) || empty( $meta['sizes'] ) ) {
+			continue;
+		}
+		$dir = ! empty( $meta['file'] ) ? trailingslashit( str_replace( '/', DIRECTORY_SEPARATOR, dirname( $meta['file'] ) ) ) : '';
+		foreach ( $meta['sizes'] as $size ) {
+			if ( empty( $size['file'] ) ) {
+				continue;
+			}
+			$rel = $dir . $size['file'];
+			$abs = realpath( $base_path . DIRECTORY_SEPARATOR . $rel );
+			if ( $abs ) {
+				$known_paths[ $abs ] = true;
+			}
+			$known_paths[ $base_path . DIRECTORY_SEPARATOR . $rel ] = true;
+		}
+	}
+
+	$media_exts = [
+		'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'svg',
+		'pdf', 'mp4', 'mp3', 'mov', 'avi', 'wmv', 'ogg', 'ogv',
+		'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+		'zip', 'psd', 'ai', 'eps', 'tiff', 'tif',
+	];
+
+	$orphans   = [];
+	$limit     = 20000;
+	$scanned   = 0;
+	$truncated = false;
+
+	try {
+		$iter = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator( $base_path, FilesystemIterator::SKIP_DOTS ),
+			RecursiveIteratorIterator::LEAVES_ONLY
+		);
+
+		foreach ( $iter as $file ) {
+			if ( ! $file->isFile() ) {
+				continue;
+			}
+			if ( ++$scanned > $limit ) {
+				$truncated = true;
+				break;
+			}
+
+			$ext = strtolower( $file->getExtension() );
+			if ( ! in_array( $ext, $media_exts, true ) ) {
+				continue;
+			}
+
+			$abs_path = $file->getRealPath();
+			if ( isset( $known_paths[ $abs_path ] ) ) {
+				continue;
+			}
+
+			$rel_path = ltrim( str_replace( $base_path, '', $abs_path ), DIRECTORY_SEPARATOR . '/' );
+			$size_raw = $file->getSize();
+			$url      = $base_url . str_replace( DIRECTORY_SEPARATOR, '/', $rel_path );
+			$type_arr = wp_check_filetype( $file->getFilename() );
+			$mime     = $type_arr['type'] ?: 'application/octet-stream';
+
+			$orphans[] = [
+				'id'       => 0,
+				'path'     => $abs_path,
+				'filename' => $file->getFilename(),
+				'url'      => $url,
+				'thumb'    => str_starts_with( $mime, 'image/' ) ? $url : null,
+				'type'     => $mime,
+				'ext'      => $ext,
+				'size'     => size_format( $size_raw ),
+				'size_raw' => $size_raw,
+				'reason'   => 'orphan',
+			];
+		}
+	} catch ( Exception $e ) {
+		wp_send_json_error( 'Scan failed: ' . esc_html( $e->getMessage() ) );
+	}
+
+	wp_send_json_success( [
+		'orphans'   => $orphans,
+		'truncated' => $truncated,
+	] );
+} );
+
+// ---------------------------------------------------------------------------
+// AJAX: delete orphaned files (on-disk files with no DB record)
+// ---------------------------------------------------------------------------
+
+add_action( 'wp_ajax_tymc_delete_orphans', function () {
+	check_ajax_referer( 'tymc_nonce', 'nonce' );
+	if ( ! current_user_can( 'delete_posts' ) ) {
+		wp_send_json_error( 'Permission denied.' );
+	}
+
+	$paths      = array_map( 'sanitize_text_field', (array) ( $_POST['paths'] ?? [] ) );
+	$upload_dir = wp_upload_dir();
+	$base_path  = realpath( $upload_dir['basedir'] );
+	$deleted    = 0;
+	$failed     = [];
+
+	if ( ! $base_path ) {
+		wp_send_json_error( 'Uploads directory not found.' );
+	}
+
+	global $wpdb;
+
+	foreach ( $paths as $path ) {
+		// Security: must resolve to a real path inside the uploads directory.
+		$real = realpath( $path );
+		if ( ! $real || 0 !== strpos( $real, $base_path . DIRECTORY_SEPARATOR ) ) {
+			$failed[] = basename( $path );
+			continue;
+		}
+
+		// Belt-and-suspenders: reject if this path is registered in the DB.
+		$rel   = ltrim( str_replace( $base_path, '', $real ), DIRECTORY_SEPARATOR . '/' );
+		$in_db = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file' AND meta_value = %s",
+				$rel
+			)
+		);
+		if ( $in_db ) {
+			$failed[] = basename( $path );
+			continue;
+		}
+
+		if ( @unlink( $real ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			$deleted++;
+		} else {
+			$failed[] = basename( $path );
+		}
+	}
+
+	wp_send_json_success( [ 'deleted' => $deleted, 'failed' => $failed ] );
+} );
+
+// ---------------------------------------------------------------------------
 // Core: batch unused filter
 // Replaces per-item queries with batch queries — ~6 queries per 100-item
 // batch instead of up to 600.
@@ -167,11 +359,17 @@ function tymc_filter_unused( array $ids ): array {
 
 	$in_use = []; // $id => true
 
-	// ── 1. Has a post parent (attached via editor uploader) ───────────────
+	// ── 1. Has a post parent whose parent post still exists and is not trashed ──
+	// An attachment with post_parent > 0 pointing to a deleted/trashed post is
+	// effectively orphaned — it should be detected as unused.
 	// Safe to interpolate: all values cast to int.
 	$id_list = implode( ',', array_map( 'intval', $ids ) );
 	$rows    = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		"SELECT ID FROM {$wpdb->posts} WHERE ID IN ($id_list) AND post_parent > 0" // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		"SELECT a.ID FROM {$wpdb->posts} AS a
+		 INNER JOIN {$wpdb->posts} AS p ON p.ID = a.post_parent
+		 WHERE a.ID IN ($id_list)
+		   AND a.post_parent > 0
+		   AND p.post_status NOT IN ('trash','auto-draft')" // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 	);
 	foreach ( $rows as $id ) {
 		$in_use[ (int) $id ] = true;
@@ -322,6 +520,10 @@ function tymc_render_page(): void {
 					</div>
 				</div>
 				<div class="tymc-app-header-actions">
+					<label class="tymc-filter-toggle" for="tymc-unattached-only">
+						<input type="checkbox" id="tymc-unattached-only">
+						Unattached only
+					</label>
 					<a
 						href="https://ko-fi.com/rkalajian"
 						target="_blank"
@@ -495,12 +697,18 @@ function tymc_render_page(): void {
 		const modal        = $('tymc-modal');
 		const modalCount   = $('tymc-modal-count');
 		const modalFilelist= $('tymc-modal-filelist');
-		const modalCancel  = $('tymc-modal-cancel');
-		const modalConfirm = $('tymc-modal-confirm');
+		const modalCancel         = $('tymc-modal-cancel');
+		const modalConfirm        = $('tymc-modal-confirm');
+		const unattachedOnlyChk   = $('tymc-unattached-only');
 
 		let allItems  = [];
-		let itemById  = new Map(); // id (number) → item — O(1) lookups
+		let itemByKey = new Map(); // key → item — O(1) lookups
 		let totalSize = 0;
+
+		// Generate a stable key for an item: real ID for DB items, path for orphans.
+		function itemKey(item) {
+			return item.id > 0 ? String(item.id) : ('orphan:' + item.path);
+		}
 
 		// ── Helpers ────────────────────────────────────────────────────────
 
@@ -559,16 +767,24 @@ function tymc_render_page(): void {
 		// ── Card builder ───────────────────────────────────────────────────
 
 		function buildCard(item) {
-			const card = document.createElement('div');
-			card.className  = 'tymc-card';
-			card.dataset.id = item.id;
+			const card    = document.createElement('div');
+			const key     = itemKey(item);
+			card.className       = 'tymc-card';
+			card.dataset.itemkey = key;
+			if (item.id > 0)   card.dataset.id   = item.id;
+			if (item.path)     card.dataset.path = item.path;
 
 			const thumbHtml = item.thumb
 				? `<img src="${item.thumb}" alt="" loading="lazy">`
 				: `<div class="tymc-card-filetype">
 					<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z"/></svg>
-					<span class="tymc-card-filetype-ext">${item.ext || item.type.split('/')[1] || '?'}</span>
+					<span class="tymc-card-filetype-ext">${item.ext || (item.type || '').split('/')[1] || '?'}</span>
 				   </div>`;
+
+			const badgeLabels = { broken: 'Missing file', orphan: 'No DB record' };
+			const badgeHtml   = item.reason && item.reason !== 'unused'
+				? `<div class="tymc-card-badge tymc-card-badge--${item.reason}">${badgeLabels[item.reason] ?? item.reason}</div>`
+				: '';
 
 			card.innerHTML = `
 				<div class="tymc-card-pip">
@@ -578,6 +794,7 @@ function tymc_render_page(): void {
 				</div>
 				<div class="tymc-card-thumb">${thumbHtml}</div>
 				<div class="tymc-card-footer">
+					${badgeHtml}
 					<div class="tymc-card-name" title="${item.filename}">${item.filename}</div>
 					<div class="tymc-card-size">${item.size}</div>
 				</div>
@@ -593,9 +810,23 @@ function tymc_render_page(): void {
 
 		// ── Scan ───────────────────────────────────────────────────────────
 
+		function addItems(items) {
+			items.forEach(item => {
+				const key = itemKey(item);
+				allItems.push(item);
+				itemByKey.set(key, item);
+				totalSize += item.size_raw || 0;
+				gridEl.appendChild(buildCard(item));
+			});
+			statsEl.hidden = false;
+			statUnused.textContent = allItems.length.toLocaleString();
+			statUnused.className   = 'tymc-stat-value' + (allItems.length > 0 ? ' is-warn' : ' is-ok');
+			statSize.textContent   = totalSize > 0 ? fmtBytes(totalSize) : '—';
+		}
+
 		async function runScan() {
 			allItems  = [];
-			itemById  = new Map();
+			itemByKey = new Map();
 			totalSize = 0;
 			gridEl.innerHTML = '';
 			resultsEl.hidden  = true;
@@ -608,12 +839,13 @@ function tymc_render_page(): void {
 			scanBtnIcon.classList.add('tymc-spin');
 			setProgress(0, 'Preparing scan…');
 
+			const unattachedOnly = unattachedOnlyChk && unattachedOnlyChk.checked;
 			let offset = 0, done = false, total = 0;
 
 			while (!done) {
 				let resp;
 				try {
-					resp = await post('tymc_scan', { offset });
+					resp = await post('tymc_scan', { offset, unattached_only: unattachedOnly ? 1 : 0 });
 				} catch {
 					showBanner('error', 'Network error — please try again.');
 					scanBtn.disabled = false;
@@ -634,24 +866,17 @@ function tymc_render_page(): void {
 				done   = resp.data.done;
 				offset = resp.data.scanned;
 
-				const pct  = total > 0 ? (offset / total) * 100 : 0;
-				setProgress(pct, `Scanning — ${offset.toLocaleString()} of ${total.toLocaleString()} files`);
+				const pct = total > 0 ? (offset / total) * 100 : 0;
+				setProgress(pct, `Scanning library — ${offset.toLocaleString()} of ${total.toLocaleString()} files`);
 
-				resp.data.items.forEach(item => {
-					allItems.push(item);
-					itemById.set(item.id, item);
-					totalSize += item.size_raw || 0;
-					gridEl.appendChild(buildCard(item));
-				});
-
-				statsEl.hidden = false;
+				addItems(resp.data.items);
 				statScanned.textContent = total.toLocaleString();
-				statUnused.textContent  = allItems.length.toLocaleString();
-				statUnused.className    = 'tymc-stat-value' + (allItems.length > 0 ? ' is-warn' : ' is-ok');
-				statSize.textContent    = totalSize > 0 ? fmtBytes(totalSize) : '—';
 			}
 
-			setProgress(100, `Scan complete — ${total.toLocaleString()} files checked`, true);
+			// Phase 2: scan filesystem for orphaned files (no DB entry).
+			await runOrphanScan();
+
+			setProgress(100, `Scan complete — ${total.toLocaleString()} library files checked`, true);
 			scanBtn.disabled = false;
 			scanBtnIcon.classList.remove('tymc-spin');
 
@@ -660,12 +885,32 @@ function tymc_render_page(): void {
 				gridCountEl.textContent = `(${allItems.length})`;
 				updateFloatBar();
 				showBanner('info',
-					`Found <strong>${allItems.length}</strong> unused file${allItems.length !== 1 ? 's' : ''} — ` +
+					`Found <strong>${allItems.length}</strong> removable file${allItems.length !== 1 ? 's' : ''} — ` +
 					`<strong>${fmtBytes(totalSize)}</strong> recoverable. Select files below, then delete.`
 				);
 			} else {
 				emptyEl.hidden = false;
 				statUnused.className = 'tymc-stat-value is-ok';
+			}
+		}
+
+		// ── Orphan scan (filesystem files with no DB record) ───────────────
+
+		async function runOrphanScan() {
+			setProgress(0, 'Scanning filesystem for orphaned files…');
+			let resp;
+			try {
+				resp = await post('tymc_scan_orphans');
+			} catch {
+				// Non-fatal — just skip orphan scan on network error.
+				return;
+			}
+			if (!resp.success) return;
+
+			addItems(resp.data.orphans);
+
+			if (resp.data.truncated) {
+				showBanner('info', 'Filesystem scan reached the 20,000-file limit and was stopped early.');
 			}
 		}
 
@@ -691,10 +936,13 @@ function tymc_render_page(): void {
 
 			modalCount.textContent = sel.length;
 			modalFilelist.innerHTML = sel.slice(0, 25).map(c => {
-				const item = itemById.get(Number(c.dataset.id));
+				const item = itemByKey.get(c.dataset.itemkey);
 				if (!item) return '';
+				const badge = item.reason && item.reason !== 'unused'
+					? `<span class="tymc-modal-badge tymc-card-badge--${item.reason}">${item.reason === 'broken' ? 'missing' : 'orphan'}</span>`
+					: '';
 				return `<div class="tymc-modal-filelist-item">
-					<span class="tymc-modal-filelist-name">${item.filename}</span>
+					<span class="tymc-modal-filelist-name">${badge}${item.filename}</span>
 					<span class="tymc-modal-filelist-size">${item.size}</span>
 				</div>`;
 			}).join('') + (sel.length > 25
@@ -720,25 +968,31 @@ function tymc_render_page(): void {
 		modalConfirm.addEventListener('click', async () => {
 			modal.hidden = true;
 
-			const sel = selectedCards();
-			const ids = sel.map(c => c.dataset.id);
-			const CHUNK = 50; // stay well under PHP's max_input_vars (default 1000)
+			const sel         = selectedCards();
+			const CHUNK       = 50; // stay well under PHP's max_input_vars (default 1000)
+			const regularCards = sel.filter(c => c.dataset.id);
+			const orphanCards  = sel.filter(c => !c.dataset.id && c.dataset.path);
+			const ids          = regularCards.map(c => c.dataset.id);
+			const paths        = orphanCards.map(c => c.dataset.path);
+			const totalCount   = sel.length;
 
 			// Switch float bar to progress mode — visible at all scroll positions.
 			floatSelection.hidden = true;
 			floatProgress.hidden  = false;
 			floatBar.hidden       = false;
 			floatBar.classList.add('is-visible');
-			setDeleteProgress(0, ids.length);
+			setDeleteProgress(0, totalCount);
 
 			noticeEl.hidden = true;
 
 			let totalDeleted = 0;
-			const allFailed  = [];
+			let processed    = 0;
+			const allFailed  = []; // ids or filenames
 
+			// Delete regular (DB-backed) items.
 			for (let i = 0; i < ids.length; i += CHUNK) {
 				const chunk = ids.slice(i, i + CHUNK);
-				setDeleteProgress(i, ids.length);
+				setDeleteProgress(processed, totalCount);
 
 				let resp;
 				try {
@@ -760,10 +1014,40 @@ function tymc_render_page(): void {
 				}
 
 				totalDeleted += resp.data.deleted;
-				allFailed.push(...resp.data.failed);
+				allFailed.push(...resp.data.failed.map(String));
+				processed += chunk.length;
 			}
 
-			setDeleteProgress(ids.length, ids.length);
+			// Delete orphan (filesystem-only) items.
+			for (let i = 0; i < paths.length; i += CHUNK) {
+				const chunk = paths.slice(i, i + CHUNK);
+				setDeleteProgress(processed, totalCount);
+
+				let resp;
+				try {
+					resp = await post('tymc_delete_orphans', { paths: chunk });
+				} catch {
+					floatSelection.hidden = false;
+					floatProgress.hidden  = true;
+					showBanner('error', 'Network error — some orphan files may not have been removed.');
+					updateFloatBar();
+					return;
+				}
+
+				if (!resp.success) {
+					floatSelection.hidden = false;
+					floatProgress.hidden  = true;
+					showBanner('error', 'Delete error: ' + (resp.data ?? 'unknown'));
+					updateFloatBar();
+					return;
+				}
+
+				totalDeleted += resp.data.deleted;
+				allFailed.push(...resp.data.failed);
+				processed += chunk.length;
+			}
+
+			setDeleteProgress(totalCount, totalCount);
 			// Brief pause so user sees 100% before the bar disappears.
 			await new Promise(r => setTimeout(r, 400));
 
@@ -774,16 +1058,28 @@ function tymc_render_page(): void {
 
 			const failedSet = new Set(allFailed.map(String));
 
+			// Remove successfully deleted cards from the UI.
 			sel.forEach(card => {
-				if (!failedSet.has(card.dataset.id)) {
+				const cardId   = card.dataset.id;
+				const cardPath = card.dataset.path;
+				const failed   = cardId ? failedSet.has(cardId) : failedSet.has(cardPath ? cardPath.split(/[\\/]/).pop() : '');
+				if (!failed) {
 					card.classList.add('is-deleting');
 					setTimeout(() => card.remove(), 240);
 				}
 			});
 
-			const deletedIdSet = new Set(ids.filter(id => !failedSet.has(id)).map(Number));
-			allItems  = allItems.filter(i => !deletedIdSet.has(i.id));
-			deletedIdSet.forEach(id => itemById.delete(id));
+			// Sync state: remove deleted items from allItems / itemByKey.
+			const deletedIds   = new Set(ids.filter(id => !failedSet.has(id)));
+			const deletedPaths = new Set(paths.filter(p => !failedSet.has(p.split(/[\\/]/).pop())));
+
+			allItems = allItems.filter(item => {
+				if (item.id > 0)  return !deletedIds.has(String(item.id));
+				if (item.path)    return !deletedPaths.has(item.path);
+				return true;
+			});
+			deletedIds.forEach(id => itemByKey.delete(id));
+			deletedPaths.forEach(p => itemByKey.delete('orphan:' + p));
 			totalSize = allItems.reduce((a, i) => a + (i.size_raw || 0), 0);
 
 			statUnused.textContent = allItems.length.toLocaleString();
